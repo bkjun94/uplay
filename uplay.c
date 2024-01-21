@@ -48,21 +48,12 @@
 #define be32toh(x) __be32_to_cpu(x)
 #endif
 
-#define DEFAULT_FORMAT		SND_PCM_FORMAT_U8
-#define DEFAULT_SPEED 		8000
-
-#define FORMAT_DEFAULT		-1
-#define FORMAT_RAW		0
-#define FORMAT_VOC		1
-#define FORMAT_WAVE		2
-#define FORMAT_AU		3
-
 /* global data */
 
-static snd_pcm_sframes_t (*readi_func)(snd_pcm_t *handle, void *buffer, snd_pcm_uframes_t size);
-static snd_pcm_sframes_t (*writei_func)(snd_pcm_t *handle, const void *buffer, snd_pcm_uframes_t size);
-static snd_pcm_sframes_t (*readn_func)(snd_pcm_t *handle, void **bufs, snd_pcm_uframes_t size);
-static snd_pcm_sframes_t (*writen_func)(snd_pcm_t *handle, void **bufs, snd_pcm_uframes_t size);
+snd_pcm_sframes_t (*readi_func)(snd_pcm_t *handle, void *buffer, snd_pcm_uframes_t size);
+snd_pcm_sframes_t (*writei_func)(snd_pcm_t *handle, const void *buffer, snd_pcm_uframes_t size);
+snd_pcm_sframes_t (*readn_func)(snd_pcm_t *handle, void **bufs, snd_pcm_uframes_t size);
+snd_pcm_sframes_t (*writen_func)(snd_pcm_t *handle, void **bufs, snd_pcm_uframes_t size);
 
 enum {
 	VUMETER_NONE,
@@ -71,21 +62,22 @@ enum {
 };
 
 static char *command;
-static snd_pcm_t *handle;
+static snd_pcm_t *handle_p;
+snd_pcm_t *handle_c;
 static struct {
 	snd_pcm_format_t format;
 	unsigned int channels;
 	unsigned int rate;
 } hwparams, rhwparams;
-static int timelimit = 0;
-static int sampleslimit = 0;
-static int quiet_mode = 0;
-static int file_type = FORMAT_DEFAULT;
-static int open_mode = 0;
+int timelimit = 0;
+int sampleslimit = 0;
+int quiet_mode = 0;
+int file_type = FORMAT_DEFAULT;
+int open_mode = 0;
 static snd_pcm_stream_t stream = SND_PCM_STREAM_PLAYBACK;
-static int mmap_flag = 0;
-static int interleaved = 1;
-static int nonblock = 0;
+int mmap_flag = 0;
+int interleaved = 1;
+int nonblock = 0;
 static volatile sig_atomic_t in_aborting = 0;
 static u_char *audiobuf = NULL;
 static snd_pcm_uframes_t chunk_size = 0;
@@ -291,11 +283,13 @@ static void version(void)
 /*
  *	Subroutine to clean up before exit.
  */
-static void prg_exit(int code) 
+void prg_exit(int code) 
 {
 	done_stdin();
-	if (handle)
-		snd_pcm_close(handle);
+	if (handle_c)
+		snd_pcm_close(handle_c);
+	if (handle_p)
+		snd_pcm_close(handle_p);
 	if (pidfile_written)
 		remove (pidfile_name);
 	exit(code);
@@ -311,18 +305,18 @@ static void signal_handler(int sig)
 		putchar('\n');
 	if (!quiet_mode)
 		fprintf(stderr, "Aborted by signal %s...\n", strsignal(sig));
-	if (handle)
-		snd_pcm_abort(handle);
+	if (handle_p)
+		snd_pcm_abort(handle_p);
 	if (sig == SIGABRT) {
 		/* do not call snd_pcm_close() and abort immediately */
-		handle = NULL;
+		handle_p = NULL;
 		prg_exit(EXIT_FAILURE);
 	}
 	signal(sig, SIG_DFL);
 }
 
 /* call on SIGUSR1 signal. */
-static void signal_handler_recycle (int sig)
+void signal_handler_recycle (int sig)
 {
 	/* flag the capture loop to start a new output file */
 	recycle_capture_file = 1;
@@ -381,11 +375,14 @@ static long parse_long(const char *str, int *err)
 	return val;
 }
 
+char pcm_name[16] = {0, };
+char pcm_name_c[16] = {0, };
+
 int main(int argc, char *argv[])
 {
 	int duration_or_sample = 0;
 	int option_index;
-	static const char short_options[] = "hnlLD:qt:c:f:r:d:s:MNF:A:R:T:B:vV:IPCi"
+	static const char short_options[] = "hnlLD:E:qt:c:f:r:d:s:MNF:A:R:T:B:vV:IPCi"
 #ifdef CONFIG_SUPPORT_CHMAP
 		"m:"
 #endif
@@ -397,6 +394,7 @@ int main(int argc, char *argv[])
 		{"list-devices", 0, 0, 'l'},
 		{"list-pcms", 0, 0, 'L'},
 		{"device", 1, 0, 'D'},
+		{"device_c", 1, 0, 'E'},
 		{"quiet", 0, 0, 'q'},
 		{"file-type", 1, 0, 't'},
 		{"channels", 1, 0, 'c'},
@@ -436,7 +434,6 @@ int main(int argc, char *argv[])
 #endif
 		{0, 0, 0, 0}
 	};
-	char *pcm_name = "default";
 	int tmp, err, c;
 	int do_device_list = 0, do_pcm_list = 0, force_sample_format = 0;
 	snd_pcm_info_t *info;
@@ -454,25 +451,14 @@ int main(int argc, char *argv[])
 
 	command = argv[0];
 	file_type = FORMAT_DEFAULT;
-	if (strstr(argv[0], "arecord")) {
-		stream = SND_PCM_STREAM_CAPTURE;
-		file_type = FORMAT_WAVE;
-		command = "arecord";
-		start_delay = 1;
-		direction = stdout;
-	} else if (strstr(argv[0], "uplay")) {
-		stream = SND_PCM_STREAM_PLAYBACK;
-		command = "uplay";//"aplay";
-		direction = stdin;
-	} else {
-		error("command should be named either arecord or aplay");
-		return 1;
-	}
+	stream = SND_PCM_STREAM_PLAYBACK;
+	command = "uplay";
+	direction = stdin;
 
 	chunk_size = -1;
 	rhwparams.format = DEFAULT_FORMAT;
 	rhwparams.rate = DEFAULT_SPEED;
-	rhwparams.channels = 1;
+	rhwparams.channels = DEFAULT_CHANNEL;
 
 	while ((c = getopt_long(argc, argv, short_options, long_options, &option_index)) != -1) {
 		switch (c) {
@@ -489,7 +475,12 @@ int main(int argc, char *argv[])
 			do_pcm_list = 1;
 			break;
 		case 'D':
-			pcm_name = optarg;
+			// pcm_name = optarg;
+			strcpy(pcm_name, optarg);
+			break;
+		case 'E':
+			// pcm_name_c = optarg;
+			strcpy(pcm_name_c, optarg);
 			break;
 		case 'q':
 			quiet_mode = 1;
@@ -734,19 +725,20 @@ int main(int argc, char *argv[])
 		goto __end;
 	}
 
-	err = snd_pcm_open(&handle, pcm_name, stream, open_mode);
+	printf("snd_pcm_open: %s\n", pcm_name);//bk.debug
+	err = snd_pcm_open(&handle_p, pcm_name, stream, open_mode);
 	if (err < 0) {
-		error("audio open error: %s", snd_strerror(err));
+		error("%s open error: %s", pcm_name, snd_strerror(err));
 		return 1;
 	}
 
-	if ((err = snd_pcm_info(handle, info)) < 0) {
+	if ((err = snd_pcm_info(handle_p, info)) < 0) {
 		error("info error: %s", snd_strerror(err));
 		return 1;
 	}
 
 	if (nonblock) {
-		err = snd_pcm_nonblock(handle, 1);
+		err = snd_pcm_nonblock(handle_p, 1);
 		if (err < 0) {
 			error("nonblock setting error: %s", snd_strerror(err));
 			return 1;
@@ -800,32 +792,36 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, signal_handler);
 	signal(SIGABRT, signal_handler);
 	signal(SIGUSR1, signal_handler_recycle);
-	if (interleaved) {
-		if (optind > argc - 1) {
-			if (stream == SND_PCM_STREAM_PLAYBACK)
-				playback(NULL);
-			else
-				capture(NULL);
-		} else {
-			while (optind <= argc - 1) {
-				if (stream == SND_PCM_STREAM_PLAYBACK)
-					playback(argv[optind++]);
-				else
-					capture(argv[optind++]);
-			}
-		}
-	} else {
-		if (stream == SND_PCM_STREAM_PLAYBACK)
-			playbackv(&argv[optind], argc - optind);
-		else
-			capturev(&argv[optind], argc - optind);
-	}
+
+	// if (interleaved) {
+	// 	if (optind > argc - 1) {
+	// 		if (stream == SND_PCM_STREAM_PLAYBACK)
+	// 			playback(NULL);
+	// 		else
+	// 			capture(NULL);
+	// 	} else {
+	// 		while (optind <= argc - 1) {
+	// 			if (stream == SND_PCM_STREAM_PLAYBACK)
+	// 				playback(argv[optind++]);
+	// 			else
+	// 				capture(argv[optind++]);
+	// 		}
+	// 	}
+	// } else {
+	// 	if (stream == SND_PCM_STREAM_PLAYBACK)
+	// 		playbackv(&argv[optind], argc - optind);
+	// 	else
+	// 		capturev(&argv[optind], argc - optind);
+	// }
+	urecord_main(argc, argv, pcm_name_c,
+		rhwparams.format, rhwparams.channels, rhwparams.rate);
+
 	if (verbose==2)
 		putchar('\n');
-	snd_pcm_close(handle);
-	handle = NULL;
+	snd_pcm_close(handle_p);
+	handle_p = NULL;
 	free(audiobuf);
-      __end:
+__end:
 	snd_output_close(log);
 	snd_config_update_free_global();
 	prg_exit(EXIT_SUCCESS);
@@ -1140,7 +1136,7 @@ static void show_available_sample_formats(snd_pcm_hw_params_t* params)
 
 	fprintf(stderr, "Available formats:\n");
 	for (format = 0; format <= SND_PCM_FORMAT_LAST; format++) {
-		if (snd_pcm_hw_params_test_format(handle, params, format) == 0)
+		if (snd_pcm_hw_params_test_format(handle_p, params, format) == 0)
 			fprintf(stderr, "- %s\n", snd_pcm_format_name(format));
 	}
 }
@@ -1161,11 +1157,11 @@ static int setup_chmap(void)
 		error("Channel numbers don't match between hw_params and channel map");
 		return -1;
 	}
-	err = snd_pcm_set_chmap(handle, chmap);
+	err = snd_pcm_set_chmap(handle_p, chmap);
 	if (!err)
 		return 0;
 
-	hw_chmap = snd_pcm_get_chmap(handle);
+	hw_chmap = snd_pcm_get_chmap(handle_p);
 	if (!hw_chmap) {
 		fprintf(stderr, "Warning: unable to get channel map\n");
 		return 0;
@@ -1226,14 +1222,14 @@ static void set_params(void)
 	snd_pcm_uframes_t start_threshold, stop_threshold;
 	snd_pcm_hw_params_alloca(&params);
 	snd_pcm_sw_params_alloca(&swparams);
-	err = snd_pcm_hw_params_any(handle, params);
+	err = snd_pcm_hw_params_any(handle_p, params);
 	if (err < 0) {
 		error("Broken configuration for this PCM: no configurations available");
 		prg_exit(EXIT_FAILURE);
 	}
 	if (dump_hw_params) {
 		fprintf(stderr, "HW Params of device \"%s\":\n",
-			snd_pcm_name(handle));
+			snd_pcm_name(handle_p));
 		fprintf(stderr, "--------------------\n");
 		snd_pcm_hw_params_dump(params, log);
 		fprintf(stderr, "--------------------\n");
@@ -1244,24 +1240,24 @@ static void set_params(void)
 		snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_INTERLEAVED);
 		snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_NONINTERLEAVED);
 		snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_COMPLEX);
-		err = snd_pcm_hw_params_set_access_mask(handle, params, mask);
+		err = snd_pcm_hw_params_set_access_mask(handle_p, params, mask);
 	} else if (interleaved)
-		err = snd_pcm_hw_params_set_access(handle, params,
+		err = snd_pcm_hw_params_set_access(handle_p, params,
 						   SND_PCM_ACCESS_RW_INTERLEAVED);
 	else
-		err = snd_pcm_hw_params_set_access(handle, params,
+		err = snd_pcm_hw_params_set_access(handle_p, params,
 						   SND_PCM_ACCESS_RW_NONINTERLEAVED);
 	if (err < 0) {
 		error("Access type not available");
 		prg_exit(EXIT_FAILURE);
 	}
-	err = snd_pcm_hw_params_set_format(handle, params, hwparams.format);
+	err = snd_pcm_hw_params_set_format(handle_p, params, hwparams.format);
 	if (err < 0) {
 		error("Sample format non available");
 		show_available_sample_formats(params);
 		prg_exit(EXIT_FAILURE);
 	}
-	err = snd_pcm_hw_params_set_channels(handle, params, hwparams.channels);
+	err = snd_pcm_hw_params_set_channels(handle_p, params, hwparams.channels);
 	if (err < 0) {
 		error("Channels count non available");
 		prg_exit(EXIT_FAILURE);
@@ -1272,18 +1268,18 @@ static void set_params(void)
 	assert(err >= 0);
 #endif
 	rate = hwparams.rate;
-	err = snd_pcm_hw_params_set_rate_near(handle, params, &hwparams.rate, 0);
+	err = snd_pcm_hw_params_set_rate_near(handle_p, params, &hwparams.rate, 0);
 	assert(err >= 0);
 	if ((float)rate * 1.05 < hwparams.rate || (float)rate * 0.95 > hwparams.rate) {
 		if (!quiet_mode) {
 			char plugex[64];
-			const char *pcmname = snd_pcm_name(handle);
+			const char *pcmname = snd_pcm_name(handle_p);
 			fprintf(stderr, "Warning: rate is not accurate (requested = %iHz, got = %iHz)\n", rate, hwparams.rate);
-			if (! pcmname || strchr(snd_pcm_name(handle), ':'))
+			if (! pcmname || strchr(snd_pcm_name(handle_p), ':'))
 				*plugex = 0;
 			else
 				snprintf(plugex, sizeof(plugex), "(-Dplug:%s)",
-					 snd_pcm_name(handle));
+					 snd_pcm_name(handle_p));
 			fprintf(stderr, "         please, try the plug plugin %s\n",
 				plugex);
 		}
@@ -1303,23 +1299,23 @@ static void set_params(void)
 			period_frames = buffer_frames / 4;
 	}
 	if (period_time > 0)
-		err = snd_pcm_hw_params_set_period_time_near(handle, params,
+		err = snd_pcm_hw_params_set_period_time_near(handle_p, params,
 							     &period_time, 0);
 	else
-		err = snd_pcm_hw_params_set_period_size_near(handle, params,
+		err = snd_pcm_hw_params_set_period_size_near(handle_p, params,
 							     &period_frames, 0);
 	assert(err >= 0);
 	if (buffer_time > 0) {
-		err = snd_pcm_hw_params_set_buffer_time_near(handle, params,
+		err = snd_pcm_hw_params_set_buffer_time_near(handle_p, params,
 							     &buffer_time, 0);
 	} else {
-		err = snd_pcm_hw_params_set_buffer_size_near(handle, params,
+		err = snd_pcm_hw_params_set_buffer_size_near(handle_p, params,
 							     &buffer_frames);
 	}
 	assert(err >= 0);
 	monotonic = snd_pcm_hw_params_is_monotonic(params);
 	can_pause = snd_pcm_hw_params_can_pause(params);
-	err = snd_pcm_hw_params(handle, params);
+	err = snd_pcm_hw_params(handle_p, params);
 	if (err < 0) {
 		error("Unable to install hw params:");
 		snd_pcm_hw_params_dump(params, log);
@@ -1332,7 +1328,7 @@ static void set_params(void)
 		      chunk_size, buffer_size);
 		prg_exit(EXIT_FAILURE);
 	}
-	err = snd_pcm_sw_params_current(handle, swparams);
+	err = snd_pcm_sw_params_current(handle_p, swparams);
 	if (err < 0) {
 		error("Unable to get current sw params.");
 		prg_exit(EXIT_FAILURE);
@@ -1341,7 +1337,7 @@ static void set_params(void)
 		n = chunk_size;
 	else
 		n = (double) rate * avail_min / 1000000;
-	err = snd_pcm_sw_params_set_avail_min(handle, swparams, n);
+	err = snd_pcm_sw_params_set_avail_min(handle_p, swparams, n);
 
 	/* round up to closest transfer boundary */
 	n = buffer_size;
@@ -1353,16 +1349,16 @@ static void set_params(void)
 		start_threshold = 1;
 	if (start_threshold > n)
 		start_threshold = n;
-	err = snd_pcm_sw_params_set_start_threshold(handle, swparams, start_threshold);
+	err = snd_pcm_sw_params_set_start_threshold(handle_p, swparams, start_threshold);
 	assert(err >= 0);
 	if (stop_delay <= 0) 
 		stop_threshold = buffer_size + (double) rate * stop_delay / 1000000;
 	else
 		stop_threshold = (double) rate * stop_delay / 1000000;
-	err = snd_pcm_sw_params_set_stop_threshold(handle, swparams, stop_threshold);
+	err = snd_pcm_sw_params_set_stop_threshold(handle_p, swparams, stop_threshold);
 	assert(err >= 0);
 
-	if (snd_pcm_sw_params(handle, swparams) < 0) {
+	if (snd_pcm_sw_params(handle_p, swparams) < 0) {
 		error("unable to install sw params:");
 		snd_pcm_sw_params_dump(swparams, log);
 		prg_exit(EXIT_FAILURE);
@@ -1372,7 +1368,7 @@ static void set_params(void)
 		prg_exit(EXIT_FAILURE);
 
 	if (verbose)
-		snd_pcm_dump(handle, log);
+		snd_pcm_dump(handle_p, log);
 
 	bits_per_sample = snd_pcm_format_physical_width(hwparams.format);
 	significant_bits_per_sample = snd_pcm_format_width(hwparams.format);
@@ -1396,7 +1392,7 @@ static void set_params(void)
 		const snd_pcm_channel_area_t *areas;
 		snd_pcm_uframes_t offset, size = chunk_size;
 		int i;
-		err = snd_pcm_mmap_begin(handle, &areas, &offset, &size);
+		err = snd_pcm_mmap_begin(handle_p, &areas, &offset, &size);
 		if (err < 0) {
 			error("snd_pcm_mmap_begin problem: %s", snd_strerror(err));
 			prg_exit(EXIT_FAILURE);
@@ -1404,7 +1400,7 @@ static void set_params(void)
 		for (i = 0; i < hwparams.channels; i++)
 			fprintf(stderr, "mmap_area[%i] = %p,%u,%u (%u)\n", i, areas[i].addr, areas[i].first, areas[i].step, snd_pcm_format_physical_width(hwparams.format));
 		/* not required, but for sure */
-		snd_pcm_mmap_commit(handle, offset, 0);
+		snd_pcm_mmap_commit(handle_p, offset, 0);
 	}
 
 	buffer_frames = buffer_size;	/* for position test */
@@ -1467,10 +1463,10 @@ static void do_pause(void)
 		fprintf(stderr, "\rPAUSE command ignored (no hw support)\n");
 		return;
 	}
-	if (snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED)
+	if (snd_pcm_state(handle_p) == SND_PCM_STATE_SUSPENDED)
 		suspend();
 
-	err = snd_pcm_pause(handle, 1);
+	err = snd_pcm_pause(handle_p, 1);
 	if (err < 0) {
 		error("pause push error: %s", snd_strerror(err));
 		return;
@@ -1479,9 +1475,9 @@ static void do_pause(void)
 		b = wait_for_input();
 		if (b == ' ' || b == '\r') {
 			while (read(fileno(stdin), &b, 1) == 1);
-			if (snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED)
+			if (snd_pcm_state(handle_p) == SND_PCM_STATE_SUSPENDED)
 				suspend();
-			err = snd_pcm_pause(handle, 0);
+			err = snd_pcm_pause(handle_p, 0);
 			if (err < 0)
 				error("pause release error: %s", snd_strerror(err));
 			return;
@@ -1540,7 +1536,7 @@ static void xrun(void)
 	int res;
 	
 	snd_pcm_status_alloca(&status);
-	if ((res = snd_pcm_status(handle, status))<0) {
+	if ((res = snd_pcm_status(handle_p, status))<0) {
 		error("status error: %s", snd_strerror(res));
 		prg_exit(EXIT_FAILURE);
 	}
@@ -1576,7 +1572,7 @@ static void xrun(void)
 			fprintf(stderr, "Status:\n");
 			snd_pcm_status_dump(status, log);
 		}
-		if ((res = snd_pcm_prepare(handle))<0) {
+		if ((res = snd_pcm_prepare(handle_p))<0) {
 			error("xrun: prepare error: %s", snd_strerror(res));
 			prg_exit(EXIT_FAILURE);
 		}
@@ -1585,7 +1581,7 @@ static void xrun(void)
 	if (snd_pcm_status_get_state(status) == SND_PCM_STATE_DRAINING) {
 		if (stream == SND_PCM_STREAM_CAPTURE) {
 			fprintf(stderr, "capture stream format change? attempting recover...\n");
-			if ((res = snd_pcm_prepare(handle))<0) {
+			if ((res = snd_pcm_prepare(handle_p))<0) {
 				error("xrun(DRAINING): prepare error: %s", snd_strerror(res));
 				prg_exit(EXIT_FAILURE);
 			}
@@ -1605,13 +1601,13 @@ static void suspend(void)
 	if (!quiet_mode) {
 		fprintf(stderr, "Suspended. Trying resume. "); fflush(stderr);
 	}
-	while ((res = snd_pcm_resume(handle)) == -EAGAIN)
+	while ((res = snd_pcm_resume(handle_p)) == -EAGAIN)
 		sleep(1);	/* wait until suspend flag is released */
 	if (res < 0) {
 		if (!quiet_mode) {
 			fprintf(stderr, "Failed. Restarting stream. "); fflush(stderr);
 		}
-		if ((res = snd_pcm_prepare(handle)) < 0) {
+		if ((res = snd_pcm_prepare(handle_p)) < 0) {
 			error("suspend: prepare error: %s", snd_strerror(res));
 			prg_exit(EXIT_FAILURE);
 		}
@@ -1853,10 +1849,10 @@ static void do_test_position(void)
 	int err;
 
 	snd_pcm_status_alloca(&status);
-	err = snd_pcm_avail_delay(handle, &avail, &delay);
+	err = snd_pcm_avail_delay(handle_p, &avail, &delay);
 	if (err < 0)
 		return;
-	err = snd_pcm_status(handle, status);
+	err = snd_pcm_status(handle_p, status);
 	if (err < 0)
 		return;
 	savail = snd_pcm_status_get_avail(status);
@@ -1996,7 +1992,7 @@ static u_char **remap_datav(u_char **data, size_t count)
  *  write function
  */
 
-static ssize_t pcm_write(u_char *data, size_t count)
+ssize_t pcm_write(u_char *data, size_t count)
 {
 	ssize_t r;
 	ssize_t result = 0;
@@ -2010,18 +2006,18 @@ static ssize_t pcm_write(u_char *data, size_t count)
 		if (test_position)
 			do_test_position();
 		check_stdin();
-		r = writei_func(handle, data, count);
+		r = writei_func(handle_p, data, count);
 		if (test_position)
 			do_test_position();
 		if (r == -EAGAIN || (r >= 0 && (size_t)r < count)) {
 			if (!test_nowait)
-				snd_pcm_wait(handle, 100);
+				snd_pcm_wait(handle_p, 100);
 		} else if (r == -EPIPE) {
 			xrun();
 		} else if (r == -ESTRPIPE) {
 			suspend();
 		} else if (r < 0) {
-//			error("write error: %s", snd_strerror(r));
+			error("write error: %s", snd_strerror(r));
 //			prg_exit(EXIT_FAILURE);
 		}
 		if (r > 0) {
@@ -2035,7 +2031,7 @@ static ssize_t pcm_write(u_char *data, size_t count)
 	return result;
 }
 
-static ssize_t pcm_writev(u_char **data, unsigned int channels, size_t count)
+ssize_t pcm_writev(u_char **data, unsigned int channels, size_t count)
 {
 	ssize_t r;
 	size_t result = 0;
@@ -2058,12 +2054,12 @@ static ssize_t pcm_writev(u_char **data, unsigned int channels, size_t count)
 		if (test_position)
 			do_test_position();
 		check_stdin();
-		r = writen_func(handle, bufs, count);
+		r = writen_func(handle_p, bufs, count);
 		if (test_position)
 			do_test_position();
 		if (r == -EAGAIN || (r >= 0 && (size_t)r < count)) {
 			if (!test_nowait)
-				snd_pcm_wait(handle, 100);
+				snd_pcm_wait(handle_p, 100);
 		} else if (r == -EPIPE) {
 			xrun();
 		} else if (r == -ESTRPIPE) {
@@ -2104,12 +2100,12 @@ static ssize_t pcm_read(u_char *data, size_t rcount)
 		if (test_position)
 			do_test_position();
 		check_stdin();
-		r = readi_func(handle, data, count);
+		r = readi_func(handle_p, data, count);
 		if (test_position)
 			do_test_position();
 		if (r == -EAGAIN || (r >= 0 && (size_t)r < count)) {
 			if (!test_nowait)
-				snd_pcm_wait(handle, 100);
+				snd_pcm_wait(handle_p, 100);
 		} else if (r == -EPIPE) {
 			xrun();
 		} else if (r == -ESTRPIPE) {
@@ -2151,12 +2147,12 @@ static ssize_t pcm_readv(u_char **data, unsigned int channels, size_t rcount)
 		if (test_position)
 			do_test_position();
 		check_stdin();
-		r = readn_func(handle, bufs, count);
+		r = readn_func(handle_p, bufs, count);
 		if (test_position)
 			do_test_position();
 		if (r == -EAGAIN || (r >= 0 && (size_t)r < count)) {
 			if (!test_nowait)
-				snd_pcm_wait(handle, 100);
+				snd_pcm_wait(handle_p, 100);
 		} else if (r == -EPIPE) {
 			xrun();
 		} else if (r == -ESTRPIPE) {
@@ -2238,9 +2234,9 @@ static void voc_pcm_flush(void)
 		if (pcm_write(audiobuf, b) != (ssize_t)b)
 			error("voc_pcm_flush error");
 	}
-	snd_pcm_nonblock(handle, 0);
-	snd_pcm_drain(handle);
-	snd_pcm_nonblock(handle, nonblock);
+	snd_pcm_nonblock(handle_p, 0);
+	snd_pcm_drain(handle_p);
+	snd_pcm_nonblock(handle_p, nonblock);
 }
 
 static void voc_play(int fd, int ofs, char *name)
@@ -2779,9 +2775,9 @@ static void playback_go(int fd, size_t loaded, off64_t count, int rtype, char *n
 		l = 0;
 	}
 	if (!in_aborting) {
-		snd_pcm_nonblock(handle, 0);
-		snd_pcm_drain(handle);
-		snd_pcm_nonblock(handle, nonblock);
+		snd_pcm_nonblock(handle_p, 0);
+		snd_pcm_drain(handle_p);
+		snd_pcm_nonblock(handle_p, nonblock);
 	}
 }
 
@@ -3017,9 +3013,9 @@ static void playbackv_go(int* fds, unsigned int channels, size_t loaded, off64_t
 		count -= r;
 	}
 	if (!in_aborting) {
-		snd_pcm_nonblock(handle, 0);
-		snd_pcm_drain(handle);
-		snd_pcm_nonblock(handle, nonblock);
+		snd_pcm_nonblock(handle_p, 0);
+		snd_pcm_drain(handle_p);
+		snd_pcm_nonblock(handle_p, nonblock);
 	}
 }
 
