@@ -30,6 +30,8 @@
 // #include "version.h"
 #include "uplay.h"
 
+extern FILE *pidf;
+
 #define ABS(a)  (a) < 0 ? -(a) : (a)
 
 #ifdef SND_CHMAP_API_VERSION
@@ -121,7 +123,6 @@ static off64_t pbrec_count = LLONG_MAX, fdcount;
 static int vocmajor, vocminor;
 
 static char *pidfile_name = NULL;
-FILE *pidf = NULL;
 static int pidfile_written = 0;
 
 #ifdef CONFIG_SUPPORT_CHMAP
@@ -381,7 +382,7 @@ static long parse_long(const char *str, int *err)
 	return val;
 }
 
-int main(int argc, char *argv[])
+int urecord_main(int argc, char *argv[])
 {
 	int duration_or_sample = 0;
 	int option_index;
@@ -2918,41 +2919,127 @@ static void playback(char *name)
 }
 
 /**
- * create_path
+ * mystrftime
  *
- *   This function creates a file path, like mkdir -p. 
+ *   Variant of strftime(3) that supports additional format
+ *   specifiers in the format string.
  *
  * Parameters:
  *
- *   path - the path to create
+ *   s	  - destination string
+ *   max	- max number of bytes to write
+ *   userformat - format string
+ *   tm	 - time information
+ *   filenumber - the number of the file, starting at 1
  *
- * Returns: 0 on success, -1 on failure
- * On failure, a message has been printed to stderr.
+ * Returns: number of bytes written to the string s
  */
-int create_path(const char *path)
+size_t mystrftime(char *s, size_t max, const char *userformat,
+		  const struct tm *tm, const int filenumber)
 {
-	char *start;
-	mode_t mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+	char formatstring[PATH_MAX] = "";
+	char tempstring[PATH_MAX] = "";
+	char *format, *tempstr;
+	const char *pos_userformat;
 
-	if (path[0] == '/')
-		start = strchr(path + 1, '/');
-	else
-		start = strchr(path, '/');
+	format = formatstring;
 
-	while (start) {
-		char *buffer = strdup(path);
-		buffer[start-path] = 0x00;
-
-		if (mkdir(buffer, mode) == -1 && errno != EEXIST) {
-			fprintf(stderr, "Problem creating directory %s", buffer);
-			perror(" ");
-			free(buffer);
-			return -1;
-		}
-		free(buffer);
-		start = strchr(start + 1, '/');
+	/* if mystrftime is called with userformat = NULL we return a zero length string */
+	if (userformat == NULL) {
+		*s = '\0';
+		return 0;
 	}
-	return 0;
+
+	for (pos_userformat = userformat; *pos_userformat; ++pos_userformat) {
+		if (*pos_userformat == '%') {
+			tempstr = tempstring;
+			tempstr[0] = '\0';
+			switch (*++pos_userformat) {
+
+				case '\0': // end of string
+					--pos_userformat;
+					break;
+
+				case 'v': // file number 
+					sprintf(tempstr, "%02d", filenumber);
+					break;
+
+				default: // All other codes will be handled by strftime
+					*format++ = '%';
+					*format++ = *pos_userformat;
+					continue;
+			}
+
+			/* If a format specifier was found and used, copy the result. */
+			if (tempstr[0]) {
+				while ((*format = *tempstr++) != '\0')
+					++format;
+				continue;
+			}
+		}
+
+		/* For any other character than % we simply copy the character */
+		*format++ = *pos_userformat;
+	}
+
+	*format = '\0';
+	format = formatstring;
+	return strftime(s, max, format, tm);
+}
+
+static int new_capture_file(char *name, char *namebuf, size_t namelen,
+			    int filecount)
+{
+	char *s;
+	char buf[PATH_MAX-10];
+	time_t t;
+	struct tm *tmp;
+
+	if (use_strftime) {
+		t = time(NULL);
+		tmp = localtime(&t);
+		if (tmp == NULL) {
+			perror("localtime");
+			prg_exit(EXIT_FAILURE);
+		}
+		if (mystrftime(namebuf, namelen, name, tmp, filecount+1) == 0) {
+			fprintf(stderr, "mystrftime returned 0");
+			prg_exit(EXIT_FAILURE);
+		}
+		return filecount;
+	}
+
+	/* get a copy of the original filename */
+	strncpy(buf, name, sizeof(buf));
+	buf[sizeof(buf)-1] = '\0';
+
+	/* separate extension from filename */
+	s = buf + strlen(buf);
+	while (s > buf && *s != '.' && *s != '/')
+		--s;
+	if (*s == '.')
+		*s++ = 0;
+	else if (*s == '/')
+		s = buf + strlen(buf);
+
+	/* upon first jump to this if block rename the first file */
+	if (filecount == 1) {
+		if (*s)
+			snprintf(namebuf, namelen, "%s-01.%s", buf, s);
+		else
+			snprintf(namebuf, namelen, "%s-01", buf);
+		remove(namebuf);
+		rename(name, namebuf);
+		filecount = 2;
+	}
+
+	/* name of the current file */
+	if (*s)
+		snprintf(namebuf, namelen, "%s-%02i.%s", buf, filecount, s);
+	else
+		snprintf(namebuf, namelen, "%s-%02i", buf, filecount);
+
+	return filecount;
 }
 
 static int safe_open(const char *name)
@@ -2967,6 +3054,124 @@ static int safe_open(const char *name)
 			fd = open(name, O_WRONLY | O_CREAT, 0644);
 	}
 	return fd;
+}
+
+void capture(char *orig_name)
+{
+	int tostdout=0;		/* boolean which describes output stream */
+	int filecount=0;	/* number of files written */
+	char *name = orig_name;	/* current filename */
+	char namebuf[PATH_MAX+2];
+	off64_t count, rest;		/* number of bytes to capture */
+	struct stat statbuf;
+
+	/* get number of bytes to capture */
+	count = calc_count();
+	if (count == 0)
+		count = LLONG_MAX;
+	/* compute the number of bytes per file */
+	max_file_size = (long long) max_file_time *
+		snd_pcm_format_size(hwparams.format,
+				    hwparams.rate * hwparams.channels);
+	/* WAVE-file should be even (I'm not sure), but wasting one byte
+	   isn't a problem (this can only be in 8 bit mono) */
+	if (count < LLONG_MAX)
+		count += count % 2;
+	else
+		count -= count % 2;
+
+	/* display verbose output to console */
+	header(file_type, name);
+
+	/* setup sound hardware */
+	set_params();
+
+	/* write to stdout? */
+	if (!name || !strcmp(name, "-")) {
+		fd = fileno(stdout);
+		name = "stdout";
+		tostdout = 1;
+		if (count > fmt_rec_table[file_type].max_filesize)
+			count = fmt_rec_table[file_type].max_filesize;
+	}
+	init_stdin();
+
+	do {
+		/* open a file to write */
+		if (!tostdout) {
+			/* upon the second file we start the numbering scheme */
+			if (filecount || use_strftime) {
+				filecount = new_capture_file(orig_name, namebuf,
+							     sizeof(namebuf),
+							     filecount);
+				name = namebuf;
+			}
+			
+			/* open a new file */
+			if (!lstat(name, &statbuf)) {
+				if (S_ISREG(statbuf.st_mode))
+					remove(name);
+			}
+			fd = safe_open(name);
+			if (fd < 0) {
+				perror(name);
+				prg_exit(EXIT_FAILURE);
+			}
+			filecount++;
+		}
+
+		rest = count;
+		if (rest > fmt_rec_table[file_type].max_filesize)
+			rest = fmt_rec_table[file_type].max_filesize;
+		if (max_file_size && (rest > max_file_size)) 
+			rest = max_file_size;
+
+		/* setup sample header */
+		if (fmt_rec_table[file_type].start)
+			fmt_rec_table[file_type].start(fd, rest);
+
+		/* capture */
+		fdcount = 0;
+		while (rest > 0 && recycle_capture_file == 0 && !in_aborting) {
+			size_t c = (rest <= (off64_t)chunk_bytes) ?
+				(size_t)rest : chunk_bytes;
+			size_t f = c * 8 / bits_per_frame;
+			size_t read = pcm_read(audiobuf, f);
+			size_t save;
+			if (read != f)
+				in_aborting = 1;
+			save = read * bits_per_frame / 8;
+			if (xwrite(fd, audiobuf, save) != save) {
+				perror(name);
+				in_aborting = 1;
+				break;
+			}
+			count -= c;
+			rest -= c;
+			fdcount += save;
+		}
+
+		/* re-enable SIGUSR1 signal */
+		if (recycle_capture_file) {
+			recycle_capture_file = 0;
+			signal(SIGUSR1, signal_handler_recycle);
+		}
+
+		/* finish sample container */
+		if (!tostdout) {
+			if (fmt_rec_table[file_type].end)
+				fmt_rec_table[file_type].end(fd);
+			close(fd);
+			fd = -1;
+		}
+
+		if (in_aborting)
+			prg_exit(EXIT_FAILURE);
+
+		/* repeat the loop when format is raw without timelimit or
+		 * requested counts of data are recorded
+		 */
+	} while ((file_type == FORMAT_RAW && !timelimit && !sampleslimit) || count > 0);
 }
 
 static void playbackv_go(int* fds, unsigned int channels, size_t loaded, off64_t count, int rtype, char **names)
