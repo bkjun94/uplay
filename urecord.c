@@ -28,6 +28,9 @@
 // #include "gettext.h"
 #include "formats.h"
 // #include "version.h"
+
+
+#include<time.h>
 #include "uplay.h"
 
 extern FILE *pidf;
@@ -88,7 +91,7 @@ static snd_pcm_stream_t stream = SND_PCM_STREAM_PLAYBACK;
 extern int mmap_flag;
 extern int interleaved;
 static int nonblock = 0;
-static volatile sig_atomic_t in_aborting = 0;
+extern volatile sig_atomic_t in_aborting;
 static u_char *audiobuf = NULL;
 static snd_pcm_uframes_t chunk_size = 0;
 static unsigned period_time = 0;
@@ -266,19 +269,19 @@ int urecord_main(int argc, char *argv[], char *pcm_name,
 		return 1;
 	}
 
-	if (pidfile_name) {
-		errno = 0;
-		pidf = fopen (pidfile_name, "w");
-		if (pidf) {
-			(void)fprintf (pidf, "%d\n", getpid());
-			fclose(pidf);
-			pidfile_written = 1;
-		} else {
-			error("Cannot create process ID file %s: %s", 
-				pidfile_name, strerror (errno));
-			return 1;
-		}
-	}
+	// if (pidfile_name) {
+	// 	errno = 0;
+	// 	pidf = fopen (pidfile_name, "w");
+	// 	if (pidf) {
+	// 		(void)fprintf (pidf, "%d\n", getpid());
+	// 		fclose(pidf);
+	// 		pidfile_written = 1;
+	// 	} else {
+	// 		error("Cannot create process ID file %s: %s", 
+	// 			pidfile_name, strerror (errno));
+	// 		return 1;
+	// 	}
+	// }
 
 	if (interleaved) {
 		if (optind > argc - 1) {
@@ -849,6 +852,7 @@ static void set_params(void)
 	significant_bits_per_sample = snd_pcm_format_width(hwparams.format);
 	bits_per_frame = bits_per_sample * hwparams.channels;
 	chunk_bytes = chunk_size * bits_per_frame / 8;
+	printf("chunk_bytes %d chunk_size %d bits_per_frame %d\n", chunk_bytes, chunk_size, bits_per_frame);//bk.debug
 	audiobuf = realloc(audiobuf, chunk_bytes);
 	if (audiobuf == NULL) {
 		error("not enough memory");
@@ -1469,7 +1473,7 @@ static ssize_t pcm_read(u_char *data, size_t rcount)
 			goto abort;
 		if (test_position)
 			do_test_position();
-		check_stdin();
+		// check_stdin();
 		r = readi_func(handle_c, data, count);
 		if (test_position)
 			do_test_position();
@@ -1481,7 +1485,7 @@ static ssize_t pcm_read(u_char *data, size_t rcount)
 		} else if (r == -ESTRPIPE) {
 			suspend();
 		} else if (r < 0) {
-//			error("read error: %s", snd_strerror(r));
+			error("read error: %s", snd_strerror(r));
 //			prg_exit(EXIT_FAILURE);
 		}
 		if (r > 0) {
@@ -2071,8 +2075,8 @@ static void end_au(int fd)
 static void header(int rtype, char *name)
 {
 	if (!quiet_mode) {
-		if (! name)
-			name = (stream == SND_PCM_STREAM_PLAYBACK) ? "stdout" : "stdin";
+		// if (! name)
+		// 	name = (stream == SND_PCM_STREAM_PLAYBACK) ? "stdout" : "stdin";
 		// fprintf(stderr, "%s %s '%s' : ",
 		// 	(stream == SND_PCM_STREAM_PLAYBACK) ? "Playing" : "Recording",
 		// 	gettext(fmt_rec_table[rtype].what),
@@ -2258,12 +2262,14 @@ static int safe_open(const char *name)
 
 void capture(char *orig_name)
 {
-	int tostdout=0;		/* boolean which describes output stream */
-	int filecount=0;	/* number of files written */
-	char *name = orig_name;	/* current filename */
-	char namebuf[PATH_MAX+2];
+	// int tostdout=0;		/* boolean which describes output stream */
+	// int filecount=0;	/* number of files written */
+	// char *name = orig_name;	/* current filename */
+	// char namebuf[PATH_MAX+2];
 	off64_t count, rest;		/* number of bytes to capture */
 	struct stat statbuf;
+
+	struct timeval stop, start;
 
 	/* get number of bytes to capture */
 	count = calc_count();
@@ -2281,72 +2287,92 @@ void capture(char *orig_name)
 		count -= count % 2;
 
 	/* display verbose output to console */
-	header(file_type, name);
+	header(file_type, NULL);//name);
 
 	/* setup sound hardware */
 	set_params();
 
-	/* write to stdout? */
-	if (!name || !strcmp(name, "-")) {
-		fd = fileno(stdout);
-		name = "stdout";
-		tostdout = 1;
-		if (count > fmt_rec_table[file_type].max_filesize)
-			count = fmt_rec_table[file_type].max_filesize;
-	}
-	init_stdin();
+	// /* write to stdout? */
+	// if (!name || !strcmp(name, "-")) {
+	// 	fd = fileno(stdout);
+	// 	name = "stdout";
+	// 	tostdout = 1;
+	// 	if (count > fmt_rec_table[file_type].max_filesize)
+	// 		count = fmt_rec_table[file_type].max_filesize;
+	// }
+	// init_stdin();
 
 	do {
-		/* open a file to write */
-		if (!tostdout) {
-			/* upon the second file we start the numbering scheme */
-			if (filecount || use_strftime) {
-				filecount = new_capture_file(orig_name, namebuf,
-							     sizeof(namebuf),
-							     filecount);
-				name = namebuf;
-			}
+		// /* open a file to write */
+		// if (!tostdout) {
+		// 	/* upon the second file we start the numbering scheme */
+		// 	if (filecount || use_strftime) {
+		// 		filecount = new_capture_file(orig_name, namebuf,
+		// 					     sizeof(namebuf),
+		// 					     filecount);
+		// 		name = namebuf;
+		// 	}
 			
-			/* open a new file */
-			if (!lstat(name, &statbuf)) {
-				if (S_ISREG(statbuf.st_mode))
-					remove(name);
-			}
-			fd = safe_open(name);
-			if (fd < 0) {
-				perror(name);
-				prg_exit(EXIT_FAILURE);
-			}
-			filecount++;
-		}
+		// 	/* open a new file */
+		// 	if (!lstat(name, &statbuf)) {
+		// 		if (S_ISREG(statbuf.st_mode))
+		// 			remove(name);
+		// 	}
+		// 	fd = safe_open(name);
+		// 	if (fd < 0) {
+		// 		perror(name);
+		// 		prg_exit(EXIT_FAILURE);
+		// 	}
+		// 	filecount++;
+		// }
 
-		rest = count;
-		if (rest > fmt_rec_table[file_type].max_filesize)
-			rest = fmt_rec_table[file_type].max_filesize;
-		if (max_file_size && (rest > max_file_size)) 
-			rest = max_file_size;
+		// rest = count;
+		// if (rest > fmt_rec_table[file_type].max_filesize)
+		// 	rest = fmt_rec_table[file_type].max_filesize;
+		// if (max_file_size && (rest > max_file_size)) 
+		// 	rest = max_file_size;
 
 		/* setup sample header */
-		if (fmt_rec_table[file_type].start)
-			fmt_rec_table[file_type].start(fd, rest);
+		// if (fmt_rec_table[file_type].start)
+		// 	fmt_rec_table[file_type].start(fd, rest);
 
 		/* capture */
-		fdcount = 0;
-		while (rest > 0 && recycle_capture_file == 0 && !in_aborting) {
-			size_t c = (rest <= (off64_t)chunk_bytes) ?
-				(size_t)rest : chunk_bytes;
+		// fdcount = 0;
+		// while (rest > 0 && recycle_capture_file == 0 && !in_aborting) {
+		while (!in_aborting) {
+			// size_t c = (rest <= (off64_t)chunk_bytes) ?
+			// 	(size_t)rest : chunk_bytes;
+			size_t c = chunk_bytes;
 			size_t f = c * 8 / bits_per_frame;
-			size_t read = pcm_read(audiobuf, f);
+			size_t read;// = pcm_read(audiobuf, f);
 			size_t save;
+			uint64_t delta_us;
+
+			gettimeofday(&start, NULL);
+
+			read = pcm_read(audiobuf, f);
+
+			gettimeofday(&stop, NULL);
+			delta_us = (stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec;
+			// printf("took %lu us\n", delta_us);
+			if (delta_us > 100000) {
+				printf("***took %lu us\n", (stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec);
+				continue;
+			}
+
 			if (read != f)
 				in_aborting = 1;
 			save = read * bits_per_frame / 8;
+			// printf(" r %d f %d s %d\n", read, f, save);//bk.debug
+
 #if 1
-			if (pcm_write(audiobuf, save) != save) {
-				perror(name);
-				in_aborting = 1;
-				break;
-			}
+			// if (pcm_write(audiobuf, save) != save) {
+			// if (pcm_write(audiobuf, read) != read) {
+			// 	// perror(name);
+			// 	in_aborting = 1;
+			// 	break;
+			// }
+			pcm_write(audiobuf, read);
 #else
 			if (xwrite(fd, audiobuf, save) != save) {
 				perror(name);
@@ -2354,24 +2380,24 @@ void capture(char *orig_name)
 				break;
 			}
 #endif
-			count -= c;
-			rest -= c;
-			fdcount += save;
+			// count -= c;
+			// rest -= c;
+			// fdcount += save;
 		}
 
-		/* re-enable SIGUSR1 signal */
-		if (recycle_capture_file) {
-			recycle_capture_file = 0;
-			signal(SIGUSR1, signal_handler_recycle);
-		}
+		// /* re-enable SIGUSR1 signal */
+		// if (recycle_capture_file) {
+		// 	recycle_capture_file = 0;
+		// 	signal(SIGUSR1, signal_handler_recycle);
+		// }
 
-		/* finish sample container */
-		if (!tostdout) {
-			if (fmt_rec_table[file_type].end)
-				fmt_rec_table[file_type].end(fd);
-			close(fd);
-			fd = -1;
-		}
+		// /* finish sample container */
+		// if (!tostdout) {
+		// 	if (fmt_rec_table[file_type].end)
+		// 		fmt_rec_table[file_type].end(fd);
+		// 	close(fd);
+		// 	fd = -1;
+		// }
 
 		if (in_aborting)
 			prg_exit(EXIT_FAILURE);

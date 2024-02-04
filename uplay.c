@@ -78,7 +78,7 @@ static snd_pcm_stream_t stream = SND_PCM_STREAM_PLAYBACK;
 int mmap_flag = 0;
 int interleaved = 1;
 int nonblock = 0;
-static volatile sig_atomic_t in_aborting = 0;
+volatile sig_atomic_t in_aborting = 0;
 static u_char *audiobuf = NULL;
 static snd_pcm_uframes_t chunk_size = 0;
 static unsigned period_time = 0;
@@ -377,6 +377,11 @@ static long parse_long(const char *str, int *err)
 
 char pcm_name[16] = {0, };
 char pcm_name_c[16] = {0, };
+
+
+static void set_params(void);
+static void header(int rtype, char *name);
+
 
 int main(int argc, char *argv[])
 {
@@ -813,6 +818,9 @@ int main(int argc, char *argv[])
 	// 	else
 	// 		capturev(&argv[optind], argc - optind);
 	// }
+	set_params();// for playback.
+	header(0, NULL);
+
 	urecord_main(argc, argv, pcm_name_c,
 		rhwparams.format, rhwparams.channels, rhwparams.rate);
 
@@ -2028,6 +2036,7 @@ ssize_t pcm_write(u_char *data, size_t count)
 			data += r * bits_per_frame / 8;
 		}
 	}
+	printf(" w %d\n", result);
 	return result;
 }
 
